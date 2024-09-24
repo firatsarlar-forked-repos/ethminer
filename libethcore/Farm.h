@@ -1,349 +1,311 @@
 /*
- This file is part of cpp-ethereum.
+ This file is part of ethminer.
 
- cpp-ethereum is free software: you can redistribute it and/or modify
+ ethminer is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation, either version 3 of the License, or
  (at your option) any later version.
 
- cpp-ethereum is distributed in the hope that it will be useful,
+ ethminer is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
 
  You should have received a copy of the GNU General Public License
- along with cpp-ethereum.  If not, see <http://www.gnu.org/licenses/>.
- */
-/** @file Farm.h
- * @author Gav Wood <i@gavwood.com>
- * @date 2015
+ along with ethminer.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #pragma once
 
+#include <atomic>
+#include <list>
+#include <thread>
+
 #include <boost/asio.hpp>
 #include <boost/bind.hpp>
-#include <thread>
-#include <list>
-#include <atomic>
+#include <boost/dll.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/process.hpp>
+
+#include <json/json.h>
+
 #include <libdevcore/Common.h>
 #include <libdevcore/Worker.h>
-#include <libethcore/Miner.h>
-#include <libethcore/BlockHeader.h>
 
-using namespace boost::asio;
+#include <libethcore/Miner.h>
+
+#include <libhwmon/wrapnvml.h>
+#if defined(__linux)
+#include <libhwmon/wrapamdsysfs.h>
+#include <sys/stat.h>
+#else
+#include <libhwmon/wrapadl.h>
+#endif
+
+extern boost::asio::io_service g_io_service;
 
 namespace dev
 {
-
 namespace eth
 {
+struct FarmSettings
+{
+    unsigned dagLoadMode = 0;  // 0 = Parallel; 1 = Serialized
+    bool noEval = false;       // Whether or not to re-evaluate solutions
+    unsigned hwMon = 0;        // 0 - No monitor; 1 - Temp and Fan; 2 - Temp Fan Power
+    unsigned ergodicity = 0;   // 0=default, 1=per session, 2=per job
+    unsigned tempStart = 40;   // Temperature threshold to restart mining (if paused)
+    unsigned tempStop = 0;     // Temperature threshold to pause mining (overheating)
+};
 
 /**
  * @brief A collective of Miners.
  * Miners ask for work, then submit proofs
  * @threadsafe
  */
-class Farm: public FarmFace
+class Farm : public FarmFace
 {
 public:
-	struct SealerDescriptor
-	{
-		std::function<unsigned()> instances;
-		std::function<Miner*(FarmFace&, unsigned)> create;
-	};
+    unsigned tstart = 0, tstop = 0;
 
-	~Farm()
-	{
-		stop();
-	}
+    Farm(std::map<std::string, DeviceDescriptor>& _DevicesCollection,
+        FarmSettings _settings, CUSettings _CUSettings, CLSettings _CLSettings,
+        CPSettings _CPSettings);
 
-	/**
-	 * @brief Sets the current mining mission.
-	 * @param _wp The work package we wish to be mining.
-	 */
-	void setWork(WorkPackage const& _wp)
-	{
-		//Collect hashrate before miner reset their work
-		collectHashRate();
+    ~Farm();
 
-		// Set work to each miner
-		Guard l(x_minerWork);
-		if (_wp.header == m_work.header && _wp.startNonce == m_work.startNonce)
-			return;
-		m_work = _wp;
-		for (auto const& m: m_miners)
-			m->setWork(m_work);
-	}
+    static Farm& f() { return *m_this; }
 
-	void setSealers(std::map<std::string, SealerDescriptor> const& _sealers) { m_sealers = _sealers; }
+    /**
+     * @brief Randomizes the nonce scrambler
+     */
+    void shuffle();
 
-	/**
-	 * @brief Start a number of miners.
-	 */
-	bool start(std::string const& _sealer, bool mixed)
-	{
-		Guard l(x_minerWork);
-		if (!m_miners.empty() && m_lastSealer == _sealer)
-			return true;
-		if (!m_sealers.count(_sealer))
-			return false;
+    /**
+     * @brief Sets the current mining mission.
+     * @param _wp The work package we wish to be mining.
+     */
+    void setWork(WorkPackage const& _newWp);
 
-		if (!mixed)
-		{
-			m_miners.clear();
-		}
-		auto ins = m_sealers[_sealer].instances();
-		unsigned start = 0;
-		if (!mixed)
-		{
-			m_miners.reserve(ins);
-		}
-		else
-		{
-			start = m_miners.size();
-			ins += start;
-			m_miners.reserve(ins);
-		}
-		for (unsigned i = start; i < ins; ++i)
-		{
-			// TODO: Improve miners creation, use unique_ptr.
-			m_miners.push_back(std::shared_ptr<Miner>(m_sealers[_sealer].create(*this, i)));
+    /**
+     * @brief Start a number of miners.
+     */
+    bool start();
 
-			// Start miners' threads. They should pause waiting for new work
-			// package.
-			m_miners.back()->startWorking();
-		}
-		m_isMining = true;
-		m_lastSealer = _sealer;
-		b_lastMixed = mixed;
+    /**
+     * @brief All mining activities to a full stop.
+     * Implies all mining threads are stopped.
+     */
+    void stop();
 
-		if (!p_hashrateTimer) {
-			p_hashrateTimer = new boost::asio::deadline_timer(m_io_service, boost::posix_time::milliseconds(1000));
-			p_hashrateTimer->async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
-			if (m_serviceThread.joinable()) {
-				m_io_service.reset();
-			}
-			else {
-				m_serviceThread = std::thread{ boost::bind(&boost::asio::io_service::run, &m_io_service) };
-			}
-		}
+    /**
+     * @brief Signals all miners to suspend mining
+     */
+    void pause();
 
-		return true;
-	}
+    /**
+     * @brief Whether or not the whole farm has been paused
+     */
+    bool paused();
 
-	/**
-	 * @brief Stop all mining activities.
-	 */
-	void stop()
-	{
-		Guard l(x_minerWork);
-		m_miners.clear();
-		m_isMining = false;
+    /**
+     * @brief Signals all miners to resume mining
+     */
+    void resume();
 
-		if (p_hashrateTimer) {
-			p_hashrateTimer->cancel();
-		}
+    /**
+     * @brief Stop all mining activities and Starts them again
+     */
+    void restart();
 
-		m_io_service.stop();
-		m_serviceThread.join();
-		p_hashrateTimer = nullptr;
-	}
+    /**
+     * @brief Stop all mining activities and Starts them again (async post)
+     */
+    void restart_async();
 
-	void collectHashRate()
-	{
-		WorkingProgress p;
-		Guard l2(x_minerWork);
-		p.ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - m_lastStart).count();
-		//Collect
-		for (auto const& i : m_miners)
-		{
-			uint64_t minerHashCount = i->hashCount();
-			p.hashes += minerHashCount;
-			p.minersHashes.push_back(minerHashCount);
-		}
+    /**
+     * @brief Returns whether or not the farm has been started
+     */
+    bool isMining() const { return m_isMining.load(std::memory_order_relaxed); }
 
-		//Reset
-		for (auto const& i : m_miners)
-		{
-			i->resetHashCount();
-		}
-		m_lastStart = std::chrono::steady_clock::now();
+    /**
+     * @brief Spawn a reboot script (reboot.bat/reboot.sh)
+     * @return false if no matching file was found
+     */
+    bool reboot(const std::vector<std::string>& args);
 
-		if (p.hashes > 0) {
-			m_lastProgresses.push_back(p);
-		}
+    /**
+     * @brief Get information on the progress of mining this work package.
+     * @return The progress with mining so far.
+     */
+    TelemetryType& Telemetry() { return m_telemetry; }
 
-		// We smooth the hashrate over the last x seconds
-		int allMs = 0;
-		for (auto const& cp : m_lastProgresses) {
-			allMs += cp.ms;
-		}
-		if (allMs > m_hashrateSmoothInterval) {
-			m_lastProgresses.erase(m_lastProgresses.begin());
-		}
-	}
+    /**
+     * @brief Gets current hashrate
+     */
+    float HashRate() { return m_telemetry.farm.hashrate; };
 
-	void processHashRate(const boost::system::error_code& ec) {
+    /**
+     * @brief Gets the collection of pointers to miner instances
+     */
+    std::vector<std::shared_ptr<Miner>> getMiners() { return m_miners; }
 
-		if (!ec) {
-			collectHashRate();
-		}
+    /**
+     * @brief Gets the number of miner instances
+     */
+    unsigned getMinersCount() { return (unsigned)m_miners.size(); };
 
-		// Restart timer 	
-		p_hashrateTimer->expires_at(p_hashrateTimer->expires_at() + boost::posix_time::milliseconds(1000));
-		p_hashrateTimer->async_wait(boost::bind(&Farm::processHashRate, this, boost::asio::placeholders::error));
-	}
-	
-	/**
-	 * @brief Stop all mining activities and Starts them again
-	 */
-	void restart()
-	{
-		stop();
-		start(m_lastSealer, b_lastMixed);
-		
-		if (m_onMinerRestart) {
-			m_onMinerRestart();
-		}
-	}
-		
-	bool isMining() const
-	{
-		return m_isMining;
-	}
+    /**
+     * @brief Gets the pointer to a miner instance
+     */
+    std::shared_ptr<Miner> getMiner(unsigned index)
+    {
+        try
+        {
+            return m_miners.at(index);
+        }
+        catch (const std::exception&)
+        {
+            return nullptr;
+        }
+    }
 
-	/**
-	 * @brief Get information on the progress of mining this work package.
-	 * @return The progress with mining so far.
-	 */
-	WorkingProgress const& miningProgress() const
-	{
-		WorkingProgress p;
-		p.ms = 0;
-		p.hashes = 0;
-		{
-			Guard l2(x_minerWork);
-			for (auto const& i : m_miners) {
-				(void) i; // unused
-				p.minersHashes.push_back(0);
-			}
-		}
+    /**
+     * @brief Accounts a solution to a miner and, as a consequence, to
+     *  the whole farm
+     */
+    void accountSolution(unsigned _minerIdx, SolutionAccountingEnum _accounting) override;
 
-		for (auto const& cp : m_lastProgresses) {
-			p.ms += cp.ms;
-			p.hashes += cp.hashes;
-			for (unsigned int i = 0; i < cp.minersHashes.size(); i++)
-			{
-				p.minersHashes.at(i) += cp.minersHashes.at(i);
-			}
-		}
+    /**
+     * @brief Gets the solutions account for the whole farm
+     */
+    SolutionAccountType getSolutions();
 
-		Guard l(x_progress);
-		m_progress = p;
-		return m_progress;
-	}
+    /**
+     * @brief Gets the solutions account for single miner
+     */
+    SolutionAccountType getSolutions(unsigned _minerIdx);
 
-	SolutionStats getSolutionStats() {
-		return m_solutionStats;
-	}
+    using SolutionFound = std::function<void(const Solution&)>;
+    using MinerRestart = std::function<void()>;
 
-	void failedSolution() {
-		m_solutionStats.failed();
-	}
+    /**
+     * @brief Provides a valid header based upon that received previously with setWork().
+     * @param _bi The now-valid header.
+     * @return true if the header was good and that the Farm should pause until more work is
+     * submitted.
+     */
+    void onSolutionFound(SolutionFound const& _handler) { m_onSolutionFound = _handler; }
 
-	void acceptedSolution(bool _stale) {
-		if (!_stale)
-		{
-			m_solutionStats.accepted();
-		}
-		else
-		{
-			m_solutionStats.acceptedStale();
-		}
-	}
+    void onMinerRestart(MinerRestart const& _handler) { m_onMinerRestart = _handler; }
 
-	void rejectedSolution(bool _stale) {
-		if (!_stale)
-		{
-			m_solutionStats.rejected();
-		}
-		else
-		{
-			m_solutionStats.rejectedStale();
-		}
-	}
+    /**
+     * @brief Gets the actual start nonce of the segment picked by the farm
+     */
+    uint64_t get_nonce_scrambler() override { return m_nonce_scrambler; }
 
-	using SolutionFound = std::function<bool(Solution const&)>;
-	using MinerRestart = std::function<void()>;
+    /**
+     * @brief Gets the actual width of each subsegment assigned to miners
+     */
+    unsigned get_segment_width() override { return m_nonce_segment_with; }
 
-	/**
-	 * @brief Provides a valid header based upon that received previously with setWork().
-	 * @param _bi The now-valid header.
-	 * @return true if the header was good and that the Farm should pause until more work is submitted.
-	 */
-	void onSolutionFound(SolutionFound const& _handler) { m_onSolutionFound = _handler; }
-	void onMinerRestart(MinerRestart const& _handler) { m_onMinerRestart = _handler; }
+    /**
+     * @brief Sets the actual start nonce of the segment picked by the farm
+     */
+    void set_nonce_scrambler(uint64_t n) { m_nonce_scrambler = n; }
 
-	WorkPackage work() const { Guard l(x_minerWork); return m_work; }
+    /**
+     * @brief Sets the actual width of each subsegment assigned to miners
+     */
+    void set_nonce_segment_width(unsigned n)
+    {
+        if (!m_currentWp.exSizeBytes)
+            m_nonce_segment_with = n;
+    }
 
-	std::chrono::steady_clock::time_point farmLaunched() {
-		return m_farm_launched;
-	}
+    /**
+     * @brief Provides the description of segments each miner is working on
+     * @return a JsonObject
+     */
+    Json::Value get_nonce_scrambler_json();
 
-	string farmLaunchedFormatted() {
-		auto d = std::chrono::steady_clock::now() - m_farm_launched;
-		int hsize = 3;
-		auto hhh = std::chrono::duration_cast<std::chrono::hours>(d);
-		if (hhh.count() < 100) {
-			hsize = 2;
-		}
-		d -= hhh;
-		auto mm = std::chrono::duration_cast<std::chrono::minutes>(d);
-		std::ostringstream stream;
-		stream << "Time: " << std::setfill('0') << std::setw(hsize) << hhh.count() << ':' << std::setfill('0') << std::setw(2) << mm.count();
-		return stream.str();
-	}
+    void setTStartTStop(unsigned tstart, unsigned tstop);
+
+    unsigned get_tstart() override { return m_Settings.tempStart; }
+
+    unsigned get_tstop() override { return m_Settings.tempStop; }
+
+    unsigned get_ergodicity() override { return m_Settings.ergodicity; }
+
+    /**
+     * @brief Called from a Miner to note a WorkPackage has a solution.
+     * @param _s The solution.
+     */
+    void submitProof(Solution const& _s) override;
 
 private:
-	/**
-	 * @brief Called from a Miner to note a WorkPackage has a solution.
-	 * @param _p The solution.
-	 * @param _wp The WorkPackage that the Solution is for.
-	 * @return true iff the solution was good (implying that mining should be .
-	 */
-	bool submitProof(Solution const& _s) override
-	{
-		assert(m_onSolutionFound);
-		return m_onSolutionFound(_s);
-	}
+    std::atomic<bool> m_paused = {false};
 
-	mutable Mutex x_minerWork;
-	std::vector<std::shared_ptr<Miner>> m_miners;
-	WorkPackage m_work;
+    // Async submits solution serializing execution
+    // in Farm's strand
+    void submitProofAsync(Solution const& _s);
 
-	std::atomic<bool> m_isMining = {false};
+    // Collects data about hashing and hardware status
+    void collectData(const boost::system::error_code& ec);
 
-	mutable Mutex x_progress;
-	mutable WorkingProgress m_progress;
+    /**
+     * @brief Spawn a file - must be located in the directory of ethminer binary
+     * @return false if file was not found or it is not executeable
+     */
+    bool spawn_file_in_bin_dir(const char* filename, const std::vector<std::string>& args);
 
-	SolutionFound m_onSolutionFound;
-	MinerRestart m_onMinerRestart;
+    mutable Mutex x_minerWork;
+    std::vector<std::shared_ptr<Miner>> m_miners;  // Collection of miners
 
-	std::map<std::string, SealerDescriptor> m_sealers;
-	std::string m_lastSealer;
-	bool b_lastMixed = false;
+    WorkPackage m_currentWp;
+    EpochContext m_currentEc;
 
-	std::chrono::steady_clock::time_point m_lastStart;
-	int m_hashrateSmoothInterval = 10000;
-	std::thread m_serviceThread;  ///< The IO service thread.
-	boost::asio::io_service m_io_service;
-	boost::asio::deadline_timer * p_hashrateTimer = nullptr;
-	std::vector<WorkingProgress> m_lastProgresses;
+    std::atomic<bool> m_isMining = {false};
 
-	mutable SolutionStats m_solutionStats;
-	std::chrono::steady_clock::time_point m_farm_launched = std::chrono::steady_clock::now();
-}; 
+    TelemetryType m_telemetry;  // Holds progress and status info for farm and miners
 
-}
-}
+    SolutionFound m_onSolutionFound;
+    MinerRestart m_onMinerRestart;
+
+    FarmSettings m_Settings;  // Own Farm Settings
+    CUSettings m_CUSettings;  // Cuda settings passed to CUDA Miner instantiator
+    CLSettings m_CLSettings;  // OpenCL settings passed to CL Miner instantiator
+    CPSettings m_CPSettings;  // CPU settings passed to CPU Miner instantiator
+
+    boost::asio::io_service::strand m_io_strand;
+    boost::asio::deadline_timer m_collectTimer;
+    static const int m_collectInterval = 5000;
+
+    string m_pool_addresses;
+
+    // StartNonce (non-NiceHash Mode) and
+    // segment width assigned to each GPU as exponent of 2
+    // considering an average block time of 15 seconds
+    // a single device GPU should need a speed of 286 Mh/s
+    // before it consumes the whole 2^32 segment
+    uint64_t m_nonce_scrambler;
+    unsigned int m_nonce_segment_with = 32;
+
+    // Wrappers for hardware monitoring libraries and their mappers
+    wrap_nvml_handle* nvmlh = nullptr;
+    std::map<string, int> map_nvml_handle = {};
+
+#if defined(__linux)
+    wrap_amdsysfs_handle* sysfsh = nullptr;
+    std::map<string, int> map_amdsysfs_handle = {};
+#else
+    wrap_adl_handle* adlh = nullptr;
+    std::map<string, int> map_adl_handle = {};
+#endif
+
+    static Farm* m_this;
+    std::map<std::string, DeviceDescriptor>& m_DevicesCollection;
+};
+
+}  // namespace eth
+}  // namespace dev

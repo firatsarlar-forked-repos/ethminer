@@ -1,128 +1,312 @@
 /*
- This file is part of cpp-ethereum.
+ This file is part of ethminer.
 
- cpp-ethereum is free software: you can redistribute it and/or modify
+ ethminer is free software: you can redistribute it and/or modify
  it under the terms of the GNU General Public License as published by
  the Free Software Foundation, either version 3 of the License, or
  (at your option) any later version.
 
- cpp-ethereum is distributed in the hope that it will be useful,
+ ethminer is distributed in the hope that it will be useful,
  but WITHOUT ANY WARRANTY; without even the implied warranty of
  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  GNU General Public License for more details.
 
  You should have received a copy of the GNU General Public License
- along with cpp-ethereum.  If not, see <http://www.gnu.org/licenses/>.
- */
-/** @file Miner.h
- * @author Gav Wood <i@gavwood.com>
- * @date 2015
+ along with ethminer.  If not, see <http://www.gnu.org/licenses/>.
  */
 
 #pragma once
 
-#include <thread>
+#include <bitset>
 #include <list>
-#include <atomic>
+#include <numeric>
 #include <string>
-#include <boost/timer.hpp>
+
+#include "EthashAux.h"
 #include <libdevcore/Common.h>
 #include <libdevcore/Log.h>
 #include <libdevcore/Worker.h>
-#include "EthashAux.h"
 
-#define MINER_WAIT_STATE_WORK	 1
+#include <boost/format.hpp>
+#include <boost/thread.hpp>
 
-
-#define DAG_LOAD_MODE_PARALLEL	 0
+#define DAG_LOAD_MODE_PARALLEL 0
 #define DAG_LOAD_MODE_SEQUENTIAL 1
-#define DAG_LOAD_MODE_SINGLE	 2
-
-#define STRATUM_PROTOCOL_STRATUM		 0
-#define STRATUM_PROTOCOL_ETHPROXY		 1
-#define STRATUM_PROTOCOL_ETHEREUMSTRATUM 2
 
 using namespace std;
 
-typedef struct {
-	string host;
-	string port;
-	string user;
-	string pass;
-} cred_t;
-
 namespace dev
 {
-
 namespace eth
 {
+enum class DeviceTypeEnum
+{
+    Unknown,
+    Cpu,
+    Gpu,
+    Accelerator
+};
+
+enum class DeviceSubscriptionTypeEnum
+{
+    None,
+    OpenCL,
+    Cuda,
+    Cpu
+
+};
 
 enum class MinerType
 {
-	Mixed,
-	CL,
-	CUDA
+    Mixed,
+    CL,
+    CUDA,
+    CPU
 };
 
-/// Describes the progress of a mining operation.
-struct WorkingProgress
+enum class HwMonitorInfoType
 {
-	uint64_t hashes = 0;		///< Total number of hashes computed.
-	uint64_t ms = 0;			///< Total number of milliseconds of mining thus far.
-	uint64_t rate() const { return ms == 0 ? 0 : hashes * 1000 / ms; }
-
-	std::vector<uint64_t> minersHashes;
-	uint64_t minerRate(const uint64_t hashCount) const { return ms == 0 ? 0 : hashCount * 1000 / ms; }
+    UNKNOWN,
+    NVIDIA,
+    AMD,
+    CPU
 };
 
-inline std::ostream& operator<<(std::ostream& _out, WorkingProgress _p)
+enum class ClPlatformTypeEnum
 {
-	float mh = _p.rate() / 1000000.0f;
-	_out << "Speed "
-		 << EthTealBold << std::fixed << std::setw(6) << std::setprecision(2) << mh << EthReset
-		 << " Mh/s    ";
-
-	for (size_t i = 0; i < _p.minersHashes.size(); ++i)
-	{
-		mh = _p.minerRate(_p.minersHashes[i]) / 1000000.0f;
-		_out << "gpu/" << i << " " << EthTeal << std::fixed << std::setw(5) << std::setprecision(2) << mh << EthReset << "  ";
-	}
-
-	return _out;
-}
-
-class SolutionStats {
-public:
-	void accepted() { accepts++;  }
-	void rejected() { rejects++;  }
-	void failed()   { failures++; }
-
-	void acceptedStale() { acceptedStales++; }
-	void rejectedStale() { rejectedStales++; }
-
-
-	void reset() { accepts = rejects = failures = acceptedStales = rejectedStales = 0; }
-
-	unsigned getAccepts()			{ return accepts; }
-	unsigned getRejects()			{ return rejects; }
-	unsigned getFailures()			{ return failures; }
-	unsigned getAcceptedStales()	{ return acceptedStales; }
-	unsigned getRejectedStales()	{ return rejectedStales; }
-private:
-	unsigned accepts  = 0;
-	unsigned rejects  = 0;
-	unsigned failures = 0; 
-
-	unsigned acceptedStales = 0;
-	unsigned rejectedStales = 0;
+    Unknown,
+    Amd,
+    Clover,
+    Nvidia,
+    Intel
 };
 
-inline std::ostream& operator<<(std::ostream& os, SolutionStats s)
+enum class SolutionAccountingEnum
 {
-	return os << "[A" << s.getAccepts() << "+" << s.getAcceptedStales() << ":R" << s.getRejects() << "+" << s.getRejectedStales() << ":F" << s.getFailures() << "]";
-}
+    Accepted,
+    Rejected,
+    Wasted,
+    Failed
+};
 
-class Miner;
+struct MinerSettings
+{
+    vector<unsigned> devices;
+};
+
+// Holds settings for CUDA Miner
+struct CUSettings : public MinerSettings
+{
+    unsigned streams = 2;
+    unsigned schedule = 4;
+    unsigned gridSize = 8192;
+    unsigned blockSize = 128;
+};
+
+// Holds settings for OpenCL Miner
+struct CLSettings : public MinerSettings
+{
+    bool noBinary = false;
+    bool noExit = false;
+    unsigned globalWorkSize = 0;
+    unsigned globalWorkSizeMultiplier = 65536;
+    unsigned localWorkSize = 128;
+};
+
+// Holds settings for CPU Miner
+struct CPSettings : public MinerSettings
+{
+};
+
+struct SolutionAccountType
+{
+    unsigned accepted = 0;
+    unsigned rejected = 0;
+    unsigned wasted = 0;
+    unsigned failed = 0;
+    std::chrono::steady_clock::time_point tstamp = std::chrono::steady_clock::now();
+    string str()
+    {
+        string _ret = "A" + to_string(accepted);
+        if (wasted)
+            _ret.append(":W" + to_string(wasted));
+        if (rejected)
+            _ret.append(":R" + to_string(rejected));
+        if (failed)
+            _ret.append(":F" + to_string(failed));
+        return _ret;
+    };
+};
+
+struct HwSensorsType
+{
+    int tempC = 0;
+    int fanP = 0;
+    double powerW = 0.0;
+    string str()
+    {
+        string _ret = to_string(tempC) + "C " + to_string(fanP) + "%";
+        if (powerW)
+            _ret.append(" " + boost::str(boost::format("%0.2f") % powerW) + "W");
+        return _ret;
+    };
+};
+
+struct TelemetryAccountType
+{
+    string prefix = "";
+    float hashrate = 0.0f;
+    bool paused = false;
+    HwSensorsType sensors;
+    SolutionAccountType solutions;
+};
+
+struct DeviceDescriptor
+{
+    DeviceTypeEnum type = DeviceTypeEnum::Unknown;
+    DeviceSubscriptionTypeEnum subscriptionType = DeviceSubscriptionTypeEnum::None;
+
+    string uniqueId;     // For GPUs this is the PCI ID
+    size_t totalMemory;  // Total memory available by device
+    string name;         // Device Name
+
+    bool clDetected;  // For OpenCL detected devices
+    string clName;
+    unsigned int clPlatformId;
+    string clPlatformName;
+    ClPlatformTypeEnum clPlatformType = ClPlatformTypeEnum::Unknown;
+    string clPlatformVersion;
+    unsigned int clPlatformVersionMajor;
+    unsigned int clPlatformVersionMinor;
+    unsigned int clDeviceOrdinal;
+    unsigned int clDeviceIndex;
+    string clDeviceVersion;
+    unsigned int clDeviceVersionMajor;
+    unsigned int clDeviceVersionMinor;
+    string clBoardName;
+    size_t clMaxMemAlloc;
+    size_t clMaxWorkGroup;
+    unsigned int clMaxComputeUnits;
+    string clNvCompute;
+    unsigned int clNvComputeMajor;
+    unsigned int clNvComputeMinor;
+
+    bool cuDetected;  // For CUDA detected devices
+    string cuName;
+    unsigned int cuDeviceOrdinal;
+    unsigned int cuDeviceIndex;
+    string cuCompute;
+    unsigned int cuComputeMajor;
+    unsigned int cuComputeMinor;
+
+    int cpCpuNumer;   // For CPU
+};
+
+struct HwMonitorInfo
+{
+    HwMonitorInfoType deviceType = HwMonitorInfoType::UNKNOWN;
+    string devicePciId;
+    int deviceIndex = -1;
+};
+
+/// Pause mining
+enum MinerPauseEnum
+{
+    PauseDueToOverHeating,
+    PauseDueToAPIRequest,
+    PauseDueToFarmPaused,
+    PauseDueToInsufficientMemory,
+    PauseDueToInitEpochError,
+    Pause_MAX  // Must always be last as a placeholder of max count
+};
+
+/// Keeps track of progress for farm and miners
+struct TelemetryType
+{
+    bool hwmon = false;
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+
+    TelemetryAccountType farm;
+    std::vector<TelemetryAccountType> miners;
+    std::string str()
+    {
+        std::stringstream _ret;
+
+        /*
+
+        Output is formatted as
+
+        Run <h:mm> <Solutions> <Speed> [<miner> ...]
+        where
+        - Run h:mm    Duration of the batch
+        - Solutions   Detailed solutions (A+R+F) per farm
+        - Speed       Actual hashing rate
+
+        each <miner> reports
+        - speed       Actual speed at the same level of
+                      magnitude for farm speed
+        - sensors     Values of sensors (temp, fan, power)
+        - solutions   Optional (LOG_PER_GPU) Solutions detail per GPU
+        */
+
+        /*
+        Calculate duration
+        */
+        auto duration = std::chrono::steady_clock::now() - start;
+        auto hours = std::chrono::duration_cast<std::chrono::hours>(duration);
+        int hoursSize = (hours.count() > 9 ? (hours.count() > 99 ? 3 : 2) : 1);
+        duration -= hours;
+        auto minutes = std::chrono::duration_cast<std::chrono::minutes>(duration);
+        _ret << EthGreen << setw(hoursSize) << hours.count() << ":" << setfill('0') << setw(2)
+             << minutes.count() << EthReset << EthWhiteBold << " " << farm.solutions.str()
+             << EthReset << " ";
+
+        /*
+        Github : @AndreaLanfranchi
+        I whish I could simply make use of getFormattedHashes but in this case
+        this would be misleading as total hashrate could be of a different order
+        of magnitude than the hashrate expressed by single devices.
+        Thus I need to set the vary same scaling index on the farm and on devices
+        */
+        static string suffixes[] = {"h", "Kh", "Mh", "Gh"};
+        float hr = farm.hashrate;
+        int magnitude = 0;
+        while (hr > 1000.0f && magnitude <= 3)
+        {
+            hr /= 1000.0f;
+            magnitude++;
+        }
+
+        _ret << EthTealBold << std::fixed << std::setprecision(2) << hr << " "
+             << suffixes[magnitude] << EthReset << " - ";
+
+        int i = -1;                 // Current miner index
+        int m = miners.size() - 1;  // Max miner index
+        for (TelemetryAccountType miner : miners)
+        {
+            i++;
+            hr = miner.hashrate;
+            if (hr > 0.0f)
+                hr /= pow(1000.0f, magnitude);
+
+            _ret << (miner.paused ? EthRed : "") << miner.prefix << i << " " << EthTeal
+                 << std::fixed << std::setprecision(2) << hr << EthReset;
+
+            if (hwmon)
+                _ret << " " << EthTeal << miner.sensors.str() << EthReset;
+
+            // Eventually push also solutions per single GPU
+            if (g_logOptions & LOG_PER_GPU)
+                _ret << " " << EthTeal << miner.solutions.str() << EthReset;
+
+            // Separator if not the last miner index
+            if (i < m)
+                _ret << ", ";
+        }
+
+        return _ret.str();
+    };
+};
 
 
 /**
@@ -133,79 +317,162 @@ class Miner;
 class FarmFace
 {
 public:
-	virtual ~FarmFace() = default;
+    FarmFace() { m_this = this; }
+    static FarmFace& f() { return *m_this; };
 
-	/**
-	 * @brief Called from a Miner to note a WorkPackage has a solution.
-	 * @param _p The solution.
-	 * @return true iff the solution was good (implying that mining should be .
-	 */
-	virtual bool submitProof(Solution const& _p) = 0;
+    virtual ~FarmFace() = default;
+    virtual unsigned get_tstart() = 0;
+    virtual unsigned get_tstop() = 0;
+    virtual unsigned get_ergodicity() = 0;
+
+    /**
+     * @brief Called from a Miner to note a WorkPackage has a solution.
+     * @param _p The solution.
+     * @return true iff the solution was good (implying that mining should be .
+     */
+    virtual void submitProof(Solution const& _p) = 0;
+    virtual void accountSolution(unsigned _minerIdx, SolutionAccountingEnum _accounting) = 0;
+    virtual uint64_t get_nonce_scrambler() = 0;
+    virtual unsigned get_segment_width() = 0;
+
+private:
+    static FarmFace* m_this;
 };
 
 /**
  * @brief A miner - a member and adoptee of the Farm.
  * @warning Not threadsafe. It is assumed Farm will synchronise calls to/from this class.
  */
-class Miner: public Worker
+
+class Miner : public Worker
 {
 public:
-	Miner(std::string const& _name, FarmFace& _farm, size_t _index):
-		Worker(_name + std::to_string(_index)),
-		index(_index),
-		farm(_farm)
-	{}
+    Miner(std::string const& _name, unsigned _index)
+      : Worker(_name + std::to_string(_index)), m_index(_index)
+    {}
 
-	virtual ~Miner() = default;
+    ~Miner() override = default;
 
-	void setWork(WorkPackage const& _work)
-	{
-		{
-			Guard l(x_work);
-			m_work = _work;
-			workSwitchStart = std::chrono::high_resolution_clock::now();
-		}
-		pause();
-		kickOff();
-		m_hashCount = 0;
-	}
+    // Sets basic info for eventual serialization of DAG load
+    static void setDagLoadInfo(unsigned _mode, unsigned _devicecount)
+    {
+        s_dagLoadMode = _mode;
+        s_dagLoadIndex = 0;
+        s_minersCount = _devicecount;
+    };
 
-	uint64_t hashCount() const { return m_hashCount; }
+    /**
+     * @brief Gets the device descriptor assigned to this instance
+     */
+    DeviceDescriptor getDescriptor();
 
-	void resetHashCount() { m_hashCount = 0; }
+    /**
+     * @brief Assigns hashing work to this instance
+     */
+    void setWork(WorkPackage const& _work);
+
+    /**
+     * @brief Assigns Epoch context to this instance
+     */
+    void setEpoch(EpochContext const& _ec) { m_epochContext = _ec; }
+
+    unsigned Index() { return m_index; };
+
+    HwMonitorInfo hwmonInfo() { return m_hwmoninfo; }
+
+    void setHwmonDeviceIndex(int i) { m_hwmoninfo.deviceIndex = i; }
+
+    /**
+     * @brief Kick an asleep miner.
+     */
+    virtual void kick_miner() = 0;
+
+    /**
+     * @brief Pauses mining setting a reason flag
+     */
+    void pause(MinerPauseEnum what);
+
+    /**
+     * @brief Whether or not this miner is paused for any reason
+     */
+    bool paused();
+
+    /**
+     * @brief Checks if the given reason for pausing is currently active
+     */
+    bool pauseTest(MinerPauseEnum what);
+
+    /**
+     * @brief Returns the human readable reason for this miner being paused
+     */
+    std::string pausedString();
+
+    /**
+     * @brief Cancels a pause flag.
+     * @note Miner can be paused for multiple reasons at a time.
+     */
+    void resume(MinerPauseEnum fromwhat);
+
+    /**
+     * @brief Retrieves currrently collected hashrate
+     */
+    float RetrieveHashRate() noexcept;
+
+    void TriggerHashRateUpdate() noexcept;
 
 protected:
+    /**
+     * @brief Initializes miner's device.
+     */
+    virtual bool initDevice() = 0;
 
-	/**
-	 * @brief Begin working on a given work package, discarding any previous work.
-	 * @param _work The package for which to find a solution.
-	 */
-	virtual void kickOff() = 0;
+    /**
+     * @brief Initializes miner to current (or changed) epoch.
+     */
+    bool initEpoch();
 
-	/**
-	 * @brief No work left to be done. Pause until told to kickOff().
-	 */
-	virtual void pause() = 0;
+    /**
+     * @brief Miner's specific initialization to current (or changed) epoch.
+     */
+    virtual bool initEpoch_internal() = 0;
 
-	WorkPackage work() const { Guard l(x_work); return m_work; }
+    /**
+     * @brief Returns current workpackage this miner is working on
+     */
+    WorkPackage work() const;
 
-	void addHashCount(uint64_t _n) { m_hashCount += _n; }
+    void updateHashRate(uint32_t _groupSize, uint32_t _increment) noexcept;
 
-	static unsigned s_dagLoadMode;
-	static volatile unsigned s_dagLoadIndex;
-	static unsigned s_dagCreateDevice;
-	static volatile void* s_dagInHostMemory;
+    static unsigned s_minersCount;   // Total Number of Miners
+    static unsigned s_dagLoadMode;   // Way dag should be loaded
+    static unsigned s_dagLoadIndex;  // In case of serialized load of dag this is the index of miner
+                                     // which should load next
 
-	const size_t index = 0;
-	FarmFace& farm;
-	std::chrono::high_resolution_clock::time_point workSwitchStart;
+    const unsigned m_index = 0;           // Ordinal index of the Instance (not the device)
+    DeviceDescriptor m_deviceDescriptor;  // Info about the device
+
+    EpochContext m_epochContext;
+
+#ifdef DEV_BUILD
+    std::chrono::steady_clock::time_point m_workSwitchStart;
+#endif
+
+    HwMonitorInfo m_hwmoninfo;
+    mutable boost::mutex x_work;
+    mutable boost::mutex x_pause;
+    boost::condition_variable m_new_work_signal;
+    boost::condition_variable m_dag_loaded_signal;
 
 private:
-	uint64_t m_hashCount = 0;
+    bitset<MinerPauseEnum::Pause_MAX> m_pauseFlags;
 
-	WorkPackage m_work;
-	mutable Mutex x_work;
+    WorkPackage m_work;
+
+    std::chrono::steady_clock::time_point m_hashTime = std::chrono::steady_clock::now();
+    std::atomic<float> m_hashRate = {0.0};
+    uint64_t m_groupCount = 0;
+    atomic<bool> m_hashRateUpdate = {false};
 };
 
-}
-}
+}  // namespace eth
+}  // namespace dev
